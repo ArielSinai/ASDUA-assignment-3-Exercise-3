@@ -23,7 +23,6 @@ def load_story_messages(xml_path: str) -> list[StoryMessage]:
     tree = ET.parse(xml_path)
     root = tree.getroot()
 
-    # participants map
     participants = root.find("w:participants", NS)
     people = {}
     if participants is not None:

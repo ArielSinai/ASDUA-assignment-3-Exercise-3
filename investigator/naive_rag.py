@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Iterable, Protocol
+import re
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
 
 from investigator.prompt_limit import enforce_prompt_limit
 from investigator.story_loader import StoryMessage
@@ -14,38 +14,115 @@ class LLMClient(Protocol):
     def complete(self, prompt: str) -> str: ...
 
 
-def chunk_messages(messages: list[StoryMessage], max_chars: int = 900) -> list[str]:
-    """
-    Creates chunks of story text. Each chunk is a concatenation of message lines.
-    We keep chunks relatively small so we can fit multiple chunks in a 3000-char prompt.
-    """
-    chunks: list[str] = []
-    current: list[str] = []
-    cur_len = 0
-
-    for m in messages:
-        line = f"[{m.ts}] {m.sender_name or m.sender_id}: {m.body}".strip()
-        if not line:
-            continue
-
-        if cur_len + len(line) + 1 > max_chars and current:
-            chunks.append("\n".join(current))
-            current = [line]
-            cur_len = len(line) + 1
-        else:
-            current.append(line)
-            cur_len += len(line) + 1
-
-    if current:
-        chunks.append("\n".join(current))
-
-    return chunks
+# -----------------------------
+# Rendering / tokenization
+# -----------------------------
 
 
-def _cosine_sim_matrix(query_vec: np.ndarray, mat: np.ndarray) -> np.ndarray:
-    q = query_vec / (np.linalg.norm(query_vec) + 1e-12)
-    m = mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12)
-    return m @ q
+def render_message_xmlish(m: StoryMessage) -> str:
+    """Render a single message in an XML-ish format similar to the exercise spec."""
+    sid = m.sender_id or "unknown"
+    rid = m.receiver_id or "unknown"
+    body = (m.body or "").strip()
+    ts = m.ts or ""
+    return (
+        f'<message id="{m.id}" ts="{ts}">\n'
+        f'  <sender ref="{sid}"/>'
+        + (f"  <!-- {m.sender_name} -->" if m.sender_name else "")
+        + "\n"
+        f'  <receiver ref="{rid}"/>'
+        + (f"  <!-- {m.receiver_name} -->" if m.receiver_name else "")
+        + "\n"
+        f"  <body>{body}</body>\n"
+        f"</message>"
+    )
+
+
+_WORD_RE = re.compile(r"[A-Za-z0-9_]+")
+
+
+def tokenize(text: str) -> list[str]:
+    return [t.lower() for t in _WORD_RE.findall(text or "")]
+
+
+_STOPWORDS = {
+    # English question glue
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "did",
+    "do",
+    "does",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "he",
+    "her",
+    "hers",
+    "him",
+    "his",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "its",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "our",
+    "she",
+    "so",
+    "that",
+    "the",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "to",
+    "us",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "you",
+    "your",
+}
+
+
+def extract_keywords(query: str, *, min_len: int = 3, max_terms: int = 8) -> list[str]:
+
+    toks = [t for t in tokenize(query) if len(t) >= min_len and t not in _STOPWORDS]
+    if not toks:
+        return []
+
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for t in toks:
+        if t not in seen:
+            uniq.append(t)
+            seen.add(t)
+
+    return uniq[:max_terms]
+
 
 
 @dataclass
@@ -54,42 +131,127 @@ class RetrievalResult:
     scores: list[float]
 
 
+def _normalize_rows(mat: np.ndarray) -> np.ndarray:
+    denom = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12
+    return mat / denom
+
+
+def _normalize_vec(v: np.ndarray) -> np.ndarray:
+    return v / (np.linalg.norm(v) + 1e-12)
+
+
+def _lexical_score(query_kws: list[str], doc_text: str) -> float:
+    if not query_kws:
+        return 0.0
+    doc_low = (doc_text or "").lower()
+    hits = sum(1 for kw in query_kws if kw in doc_low)
+    return hits / float(len(query_kws))
+
+
 class NaiveRAG:
+
     def __init__(self, embed_model: str = "all-MiniLM-L6-v2"):
-        self.model = SentenceTransformer(embed_model)
-        self.chunks: list[str] = []
+        self._embed_model_name = embed_model
+        self._embedder_import_error: Exception | None = None
+        try:
+            from sentence_transformers import SentenceTransformer  
+
+            self.model = SentenceTransformer(embed_model)
+        except Exception as e:  
+            self.model = None
+            self._embedder_import_error = e
+        self.messages: list[StoryMessage] = []
+        self.docs: list[str] = []
         self.embeddings: np.ndarray | None = None
 
-    def index(self, messages: list[StoryMessage], chunk_chars: int = 900) -> None:
-        self.chunks = chunk_messages(messages, max_chars=chunk_chars)
-        embs = self.model.encode(self.chunks, convert_to_numpy=True, normalize_embeddings=False)
+    def index(self, messages: list[StoryMessage], chunk_chars: int = 900) -> None:  # chunk_chars kept for API compat
+        if self.model is None:
+            raise RuntimeError(
+                "Missing dependency 'sentence-transformers'. Install it with: pip install sentence-transformers"
+            ) from self._embedder_import_error
+        self.messages = list(messages)
+        self.docs = [render_message_xmlish(m) for m in self.messages]
+        embs = self.model.encode(self.docs, convert_to_numpy=True, normalize_embeddings=True)
         self.embeddings = embs.astype(np.float32)
 
-    def retrieve(self, query: str, top_k: int = 5) -> RetrievalResult:
+    def _hybrid_scores(self, query: str) -> np.ndarray:
         if self.embeddings is None:
             raise RuntimeError("RAG not indexed. Call index() first.")
 
-        q_vec = self.model.encode([query], convert_to_numpy=True)[0].astype(np.float32)
-        sims = _cosine_sim_matrix(q_vec, self.embeddings)  
-        idx = np.argsort(-sims)[:top_k]
+        q_vec = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True)[0].astype(np.float32)
+        q_vec = _normalize_vec(q_vec)
+        cos = self.embeddings @ q_vec
 
+        kws = extract_keywords(query)
+        if not kws:
+            return cos
+
+        lex = np.array([_lexical_score(kws, d) for d in self.docs], dtype=np.float32)
+
+        return (0.80 * cos) + (0.20 * lex)
+
+    def retrieve(self, query: str, top_k: int = 5) -> RetrievalResult:
+        scores = self._hybrid_scores(query)
+        idx = np.argsort(-scores)[:top_k]
         return RetrievalResult(
-            chunks=[self.chunks[i] for i in idx],
-            scores=[float(sims[i]) for i in idx],
+            chunks=[self.docs[i] for i in idx],
+            scores=[float(scores[i]) for i in idx],
         )
 
+    def _expand_with_neighbors(self, hit_indices: Iterable[int], *, radius: int = 1) -> list[str]:
+        if not self.docs:
+            return []
+
+        wanted: set[int] = set()
+        n = len(self.docs)
+        for i in hit_indices:
+            for j in range(max(0, i - radius), min(n, i + radius + 1)):
+                wanted.add(j)
+
+        return [self.docs[i] for i in range(n) if i in wanted]
+
+    def _pack_excerpts(self, docs: list[str], *, max_chunk_chars: int = 800) -> list[str]:
+        chunks: list[str] = []
+        cur: list[str] = []
+        cur_len = 0
+
+        for d in docs:
+            d = d.strip()
+            if not d:
+                continue
+            add_len = len(d) + 2
+            if cur and cur_len + add_len > max_chunk_chars:
+                chunks.append("\n\n".join(cur))
+                cur = [d]
+                cur_len = len(d) + 2
+            else:
+                cur.append(d)
+                cur_len += add_len
+
+        if cur:
+            chunks.append("\n\n".join(cur))
+
+        return chunks
+
     def build_prompt(self, question: str, evidence_chunks: list[str], limit: int = 3000) -> str:
+        """Build a prompt that fits within the character limit.
+
+        If too long, we progressively drop the least relevant chunk (end of list).
         """
-        Build a prompt that fits within the character limit.
-        If too long, we progressively drop the least relevant chunks (end of list).
-        """
+
         header = (
             "You are AI Investigator 1.0.\n"
-            "Answer the user's question about the story.\n"
+            "Answer the user's question about the story.\n\n"
+            "Output format (exactly):\n"
+            "ANSWER: <short answer or 'Not conclusive.'>\n"
+            "EVIDENCE:\n"
+            "- <direct quote 1>\n"
+            "- <direct quote 2>\n"
+            "REASON: <why not conclusive, if applicable>\n\n"
             "Rules:\n"
-            "1) If you know the answer, respond with: <ANSWER> and then EVIDENCE lines quoted from the story.\n"
-            "2) Evidence must be direct quotes.\n"
-            "3) If not conclusive, say why (not in story / ambiguous / conflicting).\n\n"
+            "1) Evidence must be direct quotes from STORY EXCERPTS.\n"
+            "2) If multiple messages are needed, combine them logically.\n"
+            "3) If not conclusive, explain why (not in story / ambiguous / conflicting).\n\n"
         )
 
         chunks = list(evidence_chunks)
@@ -106,9 +268,17 @@ class NaiveRAG:
             except Exception:
                 if len(chunks) <= 1:
                     raise
-                chunks.pop()  
+                chunks.pop()
 
     def answer(self, question: str, llm: LLMClient, top_k: int = 5) -> str:
-        retrieved = self.retrieve(question, top_k=top_k)
-        prompt = self.build_prompt(question, retrieved.chunks, limit=3000)
+        if self.embeddings is None:
+            raise RuntimeError("RAG not indexed. Call index() first.")
+
+        scores = self._hybrid_scores(question)
+        hit_idx = np.argsort(-scores)[:top_k]
+
+        expanded_docs = self._expand_with_neighbors(hit_idx.tolist(), radius=1)
+        packed = self._pack_excerpts(expanded_docs, max_chunk_chars=800)
+
+        prompt = self.build_prompt(question, packed, limit=3000)
         return llm.complete(prompt)

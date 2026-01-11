@@ -19,7 +19,7 @@ def main() -> None:
         q = input("> ").strip()
         if q.lower() in {"exit", "quit"}:
             break
-        print(rag.answer(q, llm, top_k=5))
+        print(rag.answer(q, llm, top_k=8))
         print()
 
 
