@@ -87,29 +87,24 @@ class GraphRAG:
         expanded_idx = self._expand(seed_idx, radius=self.config.hop_radius)
 
         expanded_idx_sorted = sorted(expanded_idx)
-
         candidates = expanded_idx_sorted[: self.config.max_messages]
 
-        selected_blocks: list[str] = []
+        msg_blocks = [self._render_xml(self.messages[i]) for i in candidates]
 
-        for i in candidates:
-            block = self._render_xml(self.messages[i])
-
-            tentative_blocks = selected_blocks + [block]
-            tentative_context = "\n\n".join(tentative_blocks)
-
+        while True:
+            context = "\n\n".join(msg_blocks)
             try:
-                _ = self._build_prompt(question, tentative_context, limit=3000)
-                selected_blocks.append(block)
-            except ValueError:
-                break
+                prompt = self._build_prompt(question, context, limit=3000)
+                return llm.complete(prompt)
+            except Exception:
+                if msg_blocks:
+                    msg_blocks.pop()
+                    continue
 
-        if not selected_blocks and seed_idx:
-            selected_blocks = [self._render_xml(self.messages[seed_idx[0]])]
+                minimal_context = ""
+                prompt = self._build_prompt(question, minimal_context, limit=3000)
+                return llm.complete(prompt)
 
-        context = "\n\n".join(selected_blocks)
-        prompt = self._build_prompt(question, context, limit=3000)
-        return llm.complete(prompt)
 
     def _retrieve_seeds(self, question: str, top_k: int) -> list[int]:
         q_vec = self.model.encode(
