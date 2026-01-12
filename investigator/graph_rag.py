@@ -17,9 +17,9 @@ class LLMClient(Protocol):
 @dataclass
 class GraphRAGConfig:
     model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
-    seed_top_k: int = 6          # כמה הודעות “seed” לפי similarity
-    hop_radius: int = 2          # כמה צעדים בגרף להרחיב
-    max_messages: int = 18       # כמה הודעות מקסימום לשלוח ל-LLM (מגבלה רכה)
+    seed_top_k: int = 6        
+    hop_radius: int = 2         
+    max_messages: int = 18       
 
 
 class GraphRAG:
@@ -45,17 +45,13 @@ class GraphRAG:
         self.messages = [m for m in messages if (m.body or "").strip()]
         self.msg_text = [self._render(m) for m in self.messages]
 
-        # Build adjacency graph
         n = len(self.messages)
         self.adj = [set() for _ in range(n)]
 
-        # 1) temporal edges (i <-> i+1)
         for i in range(n - 1):
             self.adj[i].add(i + 1)
             self.adj[i + 1].add(i)
 
-        # 2) same sender/receiver “nearby” edges:
-        # connect each message to the previous message from same sender and same receiver
         last_by_sender: dict[str, int] = {}
         last_by_receiver: dict[str, int] = {}
 
@@ -75,7 +71,7 @@ class GraphRAG:
             if r:
                 last_by_receiver[r] = i
 
-        # embeddings
+        
         embs = self.model.encode(
             self.msg_text,
             convert_to_numpy=True,
@@ -90,13 +86,10 @@ class GraphRAG:
         seed_idx = self._retrieve_seeds(question, top_k=self.config.seed_top_k)
         expanded_idx = self._expand(seed_idx, radius=self.config.hop_radius)
 
-        # Deterministic ordering by time (index)
         expanded_idx_sorted = sorted(expanded_idx)
 
-        # Soft cap on how many candidates we even consider
         candidates = expanded_idx_sorted[: self.config.max_messages]
 
-        # ---- Prompt budgeting: add blocks incrementally until reaching 3000 chars ----
         selected_blocks: list[str] = []
 
         for i in candidates:
@@ -106,14 +99,11 @@ class GraphRAG:
             tentative_context = "\n\n".join(tentative_blocks)
 
             try:
-                # _build_prompt enforces the 3000 char limit
                 _ = self._build_prompt(question, tentative_context, limit=3000)
                 selected_blocks.append(block)
             except ValueError:
-                # Adding this block exceeds limit -> stop
                 break
 
-        # If nothing fit (rare), fall back to the single best seed message
         if not selected_blocks and seed_idx:
             selected_blocks = [self._render_xml(self.messages[seed_idx[0]])]
 
